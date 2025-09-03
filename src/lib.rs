@@ -1,3 +1,20 @@
+// Select Arrow crate version via features and expose it as `arrow`
+// Only one Arrow version feature should be enabled
+#[cfg(any(
+    all(feature = "arrow-54", feature = "arrow-55"),
+    all(feature = "arrow-54", feature = "arrow-56"),
+    all(feature = "arrow-55", feature = "arrow-56"),
+))]
+compile_error!("Features 'arrow-54', 'arrow-55' and 'arrow-56' are mutually exclusive");
+
+#[cfg(feature = "arrow-54")]
+extern crate arrow_v54 as arrow;
+#[cfg(feature = "arrow-55")]
+extern crate arrow_v55 as arrow;
+
+#[cfg(feature = "arrow-56")]
+extern crate arrow_v56 as arrow;
+
 use std::any::Any;
 use std::sync::Arc;
 
@@ -7,7 +24,9 @@ use arrow::{
     error::ArrowError,
 };
 
+#[cfg(feature = "json")]
 mod json;
+#[cfg(feature = "json")]
 pub use json::*;
 
 pub trait RowBuilder {
@@ -259,9 +278,8 @@ make_encoder!(EncodeBuilder {
     (LargeBinary, LargeBinaryBuilder),
     (BinaryView, BinaryViewBuilder),
 
-    // // Decimal variants
+    // Decimal variants
     (Decimal32, Decimal32Builder),
-    // (Decimal64, Decimal64Array),
     (Decimal128, Decimal128Builder),
     (Decimal256, Decimal256Builder),
 
@@ -275,6 +293,11 @@ make_encoder!(EncodeBuilder {
     (Dictionary, DictionaryBuilderWrapper),
     (Map, MapBuilderWrapper),
 });
+
+// Arrow < 56 does not provide Decimal32Builder. Provide a compatibility alias
+// so the enum compiles, but Decimal32 code paths are gated elsewhere.
+#[cfg(not(feature = "arrow-56"))]
+type Decimal32Builder = Decimal128Builder;
 
 pub struct ListBuilderWrapper {
     builder: ListBuilder<Box<EncodeBuilder>>,
@@ -792,6 +815,7 @@ impl EncodeBuilder {
             }
 
             // Decimal variants - use Decimal128Builder for smaller decimals
+            #[cfg(feature = "arrow-56")]
             Decimal32(precision, scale) => Ok(EncodeBuilder::Decimal32(
                 Decimal32Builder::new().with_precision_and_scale(*precision, *scale)?,
             )),
@@ -998,6 +1022,7 @@ impl EncodeBuilder {
             }
 
             // Decimal variants - same as try_new since they don't use capacity
+            #[cfg(feature = "arrow-56")]
             Decimal32(precision, scale) => Ok(EncodeBuilder::Decimal32(
                 Decimal32Builder::new().with_precision_and_scale(*precision, *scale)?,
             )),

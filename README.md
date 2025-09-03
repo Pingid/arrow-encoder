@@ -10,7 +10,6 @@ The core goal is to simplify converting data from various sources (like JSON) in
 
 - **Generic Encoding Framework**: Core traits (`RowBuilder`, `BuilderFromField`) allow for implementing custom encoders for any data source.
 - **Automatic Batching**: The `FieldBatchEncoder` handles the logic of collecting rows and flushing them into `RecordBatch`es of a specified size.
-- **Schema-Driven**: Encoders are constructed from an Arrow `Schema`, ensuring type safety and correctness.
 - **Iterator-Based**: Processes data streams efficiently using Rust's `Iterator` trait.
 - **Ready-to-use Encoders**: Ships with a `serde_json::Value` encoder out of the box.
 

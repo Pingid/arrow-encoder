@@ -68,7 +68,7 @@ impl JsonEncodeBuilder {
 impl BuilderFromField for JsonEncodeBuilder {
     type Error = JsonEncodeError;
     fn try_from_field(field: &Arc<Field>) -> Result<Self, Self::Error> {
-        JsonEncodeBuilder::try_with_capacity(field.data_type(), 1024)
+        JsonEncodeBuilder::try_new(field.data_type())
     }
 }
 
@@ -495,13 +495,16 @@ pub fn append_json(
             Ok(())
         }
 
-        // Decimal types - parse from string or number (Decimal32/64 use Decimal128Builder)
+        // Decimal types - parse from string or number
+        // Decimal32 supported only with Arrow 56+
+        #[cfg(feature = "arrow-56")]
         (EB::Decimal32(b), DT::Decimal32(_precision, scale), Json::Number(n)) => {
             let scaled_val =
                 (n.as_f64().ok_or_else(unexpected)? * 10_f64.powi(*scale as i32)) as i32;
             b.append_value(scaled_val);
             Ok(())
         }
+        #[cfg(feature = "arrow-56")]
         (EB::Decimal32(b), DT::Decimal32(_precision, scale), Json::String(s)) => {
             let num: f64 = s.parse().map_err(|_| unexpected())?;
             let scaled_val = (num * 10_f64.powi(*scale as i32)) as i32;
@@ -1465,6 +1468,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(feature = "arrow-56")]
     #[test]
     fn test_decimal32() {
         let schema = schema_with(Field::new("dec32", DT::Decimal32(6, 2), false));

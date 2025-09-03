@@ -1,0 +1,4 @@
+[alias]
+test-54 = "test --no-default-features --features json --features arrow-54"
+test-55 = "test --no-default-features --features json --features arrow-55"
+test-56 = "test --no-default-features --features json --features arrow-56"

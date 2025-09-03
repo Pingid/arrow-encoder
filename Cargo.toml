@@ -1,12 +1,26 @@
 [package]
+edition = "2024"
 name = "arrow-encoder"
 version = "0.0.1"
-edition = "2024"
 
 [dependencies]
-arrow = "56"
-base64 = "0.22"
-chrono = "0.4"
-half = "2.6"
-serde_json = "1"
+arrow_v54 = {package = "arrow", version = "54", optional = true}
+arrow_v55 = {package = "arrow", version = "55", optional = true}
+arrow_v56 = {package = "arrow", version = "56", optional = true}
+base64 = { version = "0.22", optional = true }
+chrono = { version = "0.4", optional = true }
+half = { version = "2.6", optional = true }
+serde_json = { version = "1", optional = true }
 thiserror = "2"
+
+[features]
+arrow-54 = ["dep:arrow_v54"]
+arrow-55 = ["dep:arrow_v55"]
+arrow-56 = ["dep:arrow_v56"]
+json = [
+    "dep:base64",
+    "dep:chrono",
+    "dep:half",
+    "dep:serde_json",
+]
+default = ["arrow-56", "json"]
