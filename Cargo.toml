@@ -4,23 +4,42 @@ name = "arrow-encoder"
 version = "0.0.1"
 
 [dependencies]
-arrow_v54 = {package = "arrow", version = "54", optional = true}
-arrow_v55 = {package = "arrow", version = "55", optional = true}
-arrow_v56 = {package = "arrow", version = "56", optional = true}
+arrow_v54 = { package = "arrow", version = "54", optional = true }
+arrow_v55 = { package = "arrow", version = "55", optional = true }
+arrow_v56 = { package = "arrow", version = "56", optional = true }
 base64 = { version = "0.22", optional = true }
 chrono = { version = "0.4", optional = true }
 half = { version = "2.6", optional = true }
+postgres-types = { version = "0.2.9", features = ["derive"], optional = true }
+postgres-protocol = { version = "0.6", optional = true }
+byteorder = { version = "1.5", optional = true }
+uuid = { version = "1.0", optional = true }
 serde_json = { version = "1", optional = true }
 thiserror = "2"
+tokio = { version = "1.47.1", features = [
+    "macros",
+    "rt-multi-thread",
+], optional = true }
+sqlx = { version = "0.8.6", features = [
+    "postgres",
+    "runtime-tokio",
+], optional = true }
+futures = { version = "0.3.31", optional = true }
+fallible-iterator = { version = "0.2", optional = true }
+eui48 = { version = "1.1.0", optional = true }
 
 [features]
 arrow-54 = ["dep:arrow_v54"]
 arrow-55 = ["dep:arrow_v55"]
 arrow-56 = ["dep:arrow_v56"]
-json = [
-    "dep:base64",
-    "dep:chrono",
-    "dep:half",
-    "dep:serde_json",
+json = ["dep:base64", "dep:chrono", "dep:half", "dep:serde_json"]
+postgres-core = [
+    "dep:postgres-types",
+    "dep:postgres-protocol",
+    "dep:byteorder",
+    "dep:uuid",
+    "dep:fallible-iterator",
+    "dep:eui48",
 ]
-default = ["arrow-56", "json"]
+sqlx = ["postgres-core", "dep:sqlx", "dep:tokio", "dep:futures"]
+default = ["arrow-56", "json", "postgres-core"]

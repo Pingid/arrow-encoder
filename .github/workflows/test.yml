@@ -11,7 +11,12 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        arrow-version: [54, 55, 56]
+        flags:
+          - "--features arrow-54 json"
+          - "--features arrow-55 json"
+          - "--features arrow-56 json"
+          - "--features postgres-core"
+          - "--features sqlx"
     steps:
       - uses: actions/checkout@v5
       - name: Cache cargo registry
@@ -25,5 +30,5 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Test feature arrow-${{ matrix.arrow-version }}
-        run: cargo test-${{ matrix.arrow-version }}
+      - name: Test feature ${matrix.flags}
+        run: cargo test ${matrix.flags}

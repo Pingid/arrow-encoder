@@ -15,7 +15,12 @@ extern crate arrow_v55 as arrow;
 #[cfg(feature = "arrow-56")]
 extern crate arrow_v56 as arrow;
 
+#[cfg(feature = "sqlx")]
+use futures::stream;
+#[cfg(feature = "sqlx")]
+use futures::{Stream, TryStreamExt};
 use std::any::Any;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use arrow::{
@@ -29,48 +34,71 @@ mod json;
 #[cfg(feature = "json")]
 pub use json::*;
 
-pub trait RowBuilder {
+#[cfg(feature = "postgres-core")]
+mod postgres;
+#[cfg(feature = "postgres-core")]
+pub use postgres::*;
+
+#[cfg(feature = "sqlx")]
+mod sqlx;
+#[cfg(feature = "sqlx")]
+pub use sqlx::*;
+
+/// Per-column encoder that knows how to pull its value from a row `R`.
+pub trait ColumnEncoder<R> {
     type Error;
-    type Row;
-
-    fn append_row(&mut self, field: &Arc<Field>, value: &Self::Row) -> Result<(), Self::Error>;
-
+    fn append(&mut self, row: &R) -> Result<(), Self::Error>;
     fn finish(&mut self) -> ArrayRef;
 }
 
-pub trait BuilderFromField {
+/// Factory to build a column encoder from a schema field + capacity + optional context.
+pub trait ColumnFactory<R, Ctx = ()> {
     type Error;
-    fn try_from_field(field: &Arc<Field>) -> Result<Self, Self::Error>
-    where
-        Self: Sized;
+    type Col: ColumnEncoder<R, Error = Self::Error>;
+    fn make(field: &Field, capacity: usize, ctx: &Ctx) -> Result<Self::Col, Self::Error>;
 }
 
-pub struct RowBatcher<C> {
+/// Batches rows into Arrow RecordBatches using a set of per-column encoders.
+pub struct RowBatcher<R, C> {
     schema: Arc<Schema>,
     cols: Vec<C>,
     batch_size: usize,
     rows: usize,
+    _marker: PhantomData<R>,
 }
 
-impl<C: RowBuilder<Error = E> + BuilderFromField<Error = E>, E> RowBatcher<C> {
-    pub fn from_schema(schema: Arc<Schema>, batch_size: usize) -> Result<Self, E> {
-        let cols = schema
-            .fields()
-            .iter()
-            .map(|f| C::try_from_field(f))
-            .collect::<Result<Vec<_>, _>>()?;
-        Self::new(schema, cols, batch_size)
-    }
-}
-
-impl<C: RowBuilder> RowBatcher<C> {
-    pub fn new(schema: Arc<Schema>, cols: Vec<C>, batch_size: usize) -> Result<Self, C::Error> {
-        Ok(Self {
+impl<R, C: ColumnEncoder<R>> RowBatcher<R, C> {
+    pub fn new(schema: Arc<Schema>, cols: Vec<C>, batch_size: usize) -> Self {
+        assert!(batch_size > 0, "batch_size must be greater than 0");
+        Self {
             schema,
             cols,
             batch_size,
             rows: 0,
-        })
+            _marker: PhantomData,
+        }
+    }
+
+    /// Build from a schema using a factory. Function-generic → no E0207.
+    pub fn from_schema_with<F, Ctx>(
+        schema: Arc<Schema>,
+        batch_size: usize,
+        ctx: &Ctx,
+    ) -> Result<Self, F::Error>
+    where
+        F: ColumnFactory<R, Ctx, Col = C, Error = C::Error>,
+    {
+        let cols = schema
+            .fields()
+            .iter()
+            .map(|f| F::make(f, batch_size, ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self::new(schema, cols, batch_size))
+    }
+
+    pub fn schema(&self) -> &Arc<Schema> {
+        &self.schema
     }
 
     #[inline]
@@ -83,54 +111,58 @@ impl<C: RowBuilder> RowBatcher<C> {
         self.rows == 0
     }
 
-    pub fn push_row(&mut self, row: &C::Row) -> Result<(), C::Error> {
-        // For each column, fetch value from the row via FieldDef and append
-        for (col, f) in self.cols.iter_mut().zip(self.schema.fields().iter()) {
-            col.append_row(f, row)?;
+    pub fn push_row(&mut self, row: &R) -> Result<(), C::Error> {
+        for col in self.cols.iter_mut() {
+            col.append(row)?;
         }
         self.rows += 1;
         Ok(())
     }
 
-    pub fn finish_batch(&mut self) -> Result<RecordBatch, ArrowError> {
+    pub fn finish_batch(&mut self) -> Result<RecordBatch, C::Error>
+    where
+        C::Error: From<ArrowError>,
+    {
         let arrays: Vec<ArrayRef> = self.cols.iter_mut().map(|c| c.finish()).collect();
         self.rows = 0;
-        RecordBatch::try_new(self.schema.clone(), arrays)
+        RecordBatch::try_new(self.schema.clone(), arrays).map_err(From::from)
     }
 }
-
-pub struct FieldBatchEncoder<C: RowBuilder, V: Iterator<Item = C::Row>> {
+/// Iterator adapter: turns an iterator of rows into batches.
+pub struct FieldBatchEncoder<R, C: ColumnEncoder<R>, V: Iterator<Item = R>> {
     values: V,
-    batcher: RowBatcher<C>,
+    batcher: RowBatcher<R, C>,
 }
 
-impl<
-    C: RowBuilder<Error = E> + BuilderFromField<Error = E>,
-    V: Iterator<Item = C::Row>,
-    E: From<ArrowError>,
-> FieldBatchEncoder<C, V>
+impl<R, C, V> FieldBatchEncoder<R, C, V>
+where
+    C: ColumnEncoder<R>,
+    V: Iterator<Item = R>,
 {
-    pub fn from_schema(schema: Arc<Schema>, values: V, batch_size: usize) -> Result<Self, E> {
-        let batcher = RowBatcher::<C>::from_schema(schema, batch_size)?;
-        Ok(Self { values, batcher })
-    }
-}
-
-impl<E: From<ArrowError>, C: RowBuilder<Error = E>, V: Iterator<Item = C::Row>>
-    FieldBatchEncoder<C, V>
-{
-    pub fn new(
+    /// Build from schema + factory (function-generic).
+    pub fn from_schema_with<F, Ctx>(
         schema: Arc<Schema>,
-        cols: Vec<C>,
         values: V,
         batch_size: usize,
-    ) -> Result<Self, C::Error> {
-        let batcher = RowBatcher::new(schema, cols, batch_size)?;
+        ctx: &Ctx,
+    ) -> Result<Self, F::Error>
+    where
+        F: ColumnFactory<R, Ctx, Col = C, Error = C::Error>,
+    {
+        let batcher = RowBatcher::<R, C>::from_schema_with::<F, Ctx>(schema, batch_size, ctx)?;
         Ok(Self { values, batcher })
+    }
+
+    pub fn new(schema: Arc<Schema>, cols: Vec<C>, values: V, batch_size: usize) -> Self {
+        let batcher = RowBatcher::new(schema, cols, batch_size);
+        Self { values, batcher }
     }
 
     /// Fills up to `batch_size` rows or until the input iterator is exhausted.
-    pub fn write_next(&mut self) -> Result<Option<RecordBatch>, C::Error> {
+    pub fn write_next(&mut self) -> Result<Option<RecordBatch>, C::Error>
+    where
+        C::Error: From<ArrowError>,
+    {
         while !self.batcher.is_full() {
             match self.values.next() {
                 Some(row) => self.batcher.push_row(&row)?,
@@ -146,8 +178,11 @@ impl<E: From<ArrowError>, C: RowBuilder<Error = E>, V: Iterator<Item = C::Row>>
     }
 }
 
-impl<E: From<ArrowError>, C: RowBuilder<Error = E>, V: Iterator<Item = C::Row>> Iterator
-    for FieldBatchEncoder<C, V>
+impl<R, E, C, V> Iterator for FieldBatchEncoder<R, C, V>
+where
+    C: ColumnEncoder<R, Error = E>,
+    V: Iterator<Item = R>,
+    E: From<ArrowError>,
 {
     type Item = Result<RecordBatch, E>;
 
@@ -156,8 +191,47 @@ impl<E: From<ArrowError>, C: RowBuilder<Error = E>, V: Iterator<Item = C::Row>> 
     }
 }
 
+/// Async variant over a `Stream` of rows.
+#[cfg(feature = "sqlx")]
+pub fn encode_stream<R, C, E, S>(
+    batcher: RowBatcher<R, C>,
+    values: S,
+) -> impl Stream<Item = Result<RecordBatch, E>>
+where
+    C: ColumnEncoder<R, Error = E>,
+    S: Stream<Item = Result<R, E>>,
+    E: From<ArrowError>,
+{
+    stream::try_unfold(
+        (Box::pin(values), batcher),
+        |(mut values_stream, mut batcher)| async move {
+            let mut count = 0;
+            let batch_size = batcher.batch_size;
+
+            while count < batch_size {
+                match values_stream.try_next().await {
+                    Ok(Some(row)) => {
+                        batcher.push_row(&row)?;
+                        count += 1;
+                    }
+                    Ok(None) => break,
+                    Err(e) => return Err(e),
+                }
+            }
+
+            if count == 0 {
+                Ok(None)
+            } else {
+                let batch = batcher.finish_batch()?;
+                Ok(Some((batch, (values_stream, batcher))))
+            }
+        },
+    )
+}
+
 macro_rules! make_encoder {
     ($name:ident { $(($variant:ident, $builder:ty)),* $(,)? }) => {
+        #[derive(Debug)]
         pub enum $name {
             $( $variant($builder) ),*
         }
@@ -199,7 +273,7 @@ macro_rules! make_encoder {
                 match self.as_mut() { $( $name::$variant(b) => b.as_any_mut(), )* }
             }
             fn into_box_any(self: Box<Self>) -> Box<dyn Any> {
-                unimplemented!()
+                self
             }
             fn len(&self) -> usize {
                 match self.as_ref() { $( $name::$variant(b) => b.len(), )* }
@@ -299,6 +373,7 @@ make_encoder!(EncodeBuilder {
 #[cfg(not(feature = "arrow-56"))]
 type Decimal32Builder = Decimal128Builder;
 
+#[derive(Debug)]
 pub struct ListBuilderWrapper {
     builder: ListBuilder<Box<EncodeBuilder>>,
     field: Arc<Field>,
@@ -357,6 +432,7 @@ impl ArrayBuilder for ListBuilderWrapper {
     }
 }
 
+#[derive(Debug)]
 pub struct FixedSizeListBuilderWrapper {
     builder: FixedSizeListBuilder<Box<EncodeBuilder>>,
     field: Arc<Field>,
@@ -435,6 +511,7 @@ impl ArrayBuilder for FixedSizeListBuilderWrapper {
 }
 
 // Wrapper for StructBuilder to work with EncodeBuilder field builders
+#[derive(Debug)]
 pub struct StructBuilderWrapper {
     // builder: StructBuilder,
     fields: Fields,
@@ -460,11 +537,11 @@ impl ArrayBuilder for StructBuilderWrapper {
     }
 
     fn finish(&mut self) -> ArrayRef {
-        Arc::new(self.finnish())
+        Arc::new(self.finish_struct())
     }
 
     fn finish_cloned(&self) -> ArrayRef {
-        Arc::new(self.finish_cloned())
+        Arc::new(self.finish_struct_cloned())
     }
 }
 
@@ -488,7 +565,7 @@ impl StructBuilderWrapper {
         self.append(false);
     }
 
-    pub fn finnish(&mut self) -> StructArray {
+    pub fn finish_struct(&mut self) -> StructArray {
         if self.fields.is_empty() {
             return StructArray::new_empty_fields(self.len(), self.null_buffer_builder.finish());
         }
@@ -498,7 +575,7 @@ impl StructBuilderWrapper {
         StructArray::new(self.fields.clone(), arrays, nulls)
     }
 
-    pub fn finish_cloned(&self) -> StructArray {
+    pub fn finish_struct_cloned(&self) -> StructArray {
         if self.fields.is_empty() {
             return StructArray::new_empty_fields(
                 self.len(),
@@ -513,6 +590,7 @@ impl StructBuilderWrapper {
 }
 
 // Wrapper for LargeListBuilder
+#[derive(Debug)]
 pub struct LargeListBuilderWrapper {
     builder: LargeListBuilder<Box<EncodeBuilder>>,
     field: Arc<Field>,
@@ -581,6 +659,12 @@ pub struct DictionaryBuilderWrapper {
     builder: StringDictionaryBuilder<Int32Type>,
 }
 
+impl std::fmt::Debug for DictionaryBuilderWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DictionaryBuilderWrapper")
+    }
+}
+
 impl DictionaryBuilderWrapper {
     pub fn new(builder: StringDictionaryBuilder<Int32Type>) -> Self {
         Self { builder }
@@ -618,6 +702,7 @@ impl ArrayBuilder for DictionaryBuilderWrapper {
 }
 
 // Wrapper for MapBuilder
+#[derive(Debug)]
 pub struct MapBuilderWrapper {
     builder: MapBuilder<StringBuilder, Box<EncodeBuilder>>,
     field: Arc<Field>,
@@ -629,7 +714,9 @@ impl MapBuilderWrapper {
     }
 
     pub fn append_null(&mut self) {
-        self.builder.append(false).unwrap();
+        self.builder
+            .append(false)
+            .expect("Failed to append null to MapBuilder")
     }
 
     pub fn keys(&mut self) -> &mut StringBuilder {
@@ -749,16 +836,18 @@ impl EncodeBuilder {
             Float32 => Ok(EncodeBuilder::F32(Float32Builder::new())),
             Float64 => Ok(EncodeBuilder::F64(Float64Builder::new())),
             // Timestamp variants
-            Timestamp(Second, _tz) => Ok(EncodeBuilder::TsSecond(TimestampSecondBuilder::new())),
-            Timestamp(Millisecond, _tz) => {
-                Ok(EncodeBuilder::TsMs(TimestampMillisecondBuilder::new()))
-            }
-            Timestamp(Microsecond, _tz) => {
-                Ok(EncodeBuilder::TsMicro(TimestampMicrosecondBuilder::new()))
-            }
-            Timestamp(Nanosecond, _tz) => {
-                Ok(EncodeBuilder::TsNano(TimestampNanosecondBuilder::new()))
-            }
+            Timestamp(Second, tz) => Ok(EncodeBuilder::TsSecond(
+                TimestampSecondBuilder::new().with_timezone_opt(tz.clone()),
+            )),
+            Timestamp(Millisecond, tz) => Ok(EncodeBuilder::TsMs(
+                TimestampMillisecondBuilder::new().with_timezone_opt(tz.clone()),
+            )),
+            Timestamp(Microsecond, tz) => Ok(EncodeBuilder::TsMicro(
+                TimestampMicrosecondBuilder::new().with_timezone_opt(tz.clone()),
+            )),
+            Timestamp(Nanosecond, tz) => Ok(EncodeBuilder::TsNano(
+                TimestampNanosecondBuilder::new().with_timezone_opt(tz.clone()),
+            )),
 
             // Date variants
             Date32 => Ok(EncodeBuilder::Date32(Date32Builder::new())),
@@ -921,19 +1010,23 @@ impl EncodeBuilder {
             Float32 => Ok(EncodeBuilder::F32(Float32Builder::new())),
             Float64 => Ok(EncodeBuilder::F64(Float64Builder::new())),
             // Timestamp variants
-            Timestamp(Second, _tz) => Ok(EncodeBuilder::TsSecond(TimestampSecondBuilder::new())),
-            Timestamp(Millisecond, _tz) => {
-                Ok(EncodeBuilder::TsMs(TimestampMillisecondBuilder::new()))
-            }
-            Timestamp(Microsecond, _tz) => {
-                Ok(EncodeBuilder::TsMicro(TimestampMicrosecondBuilder::new()))
-            }
-            Timestamp(Nanosecond, _tz) => {
-                Ok(EncodeBuilder::TsNano(TimestampNanosecondBuilder::new()))
-            }
+            Timestamp(Second, tz) => Ok(EncodeBuilder::TsSecond(
+                TimestampSecondBuilder::new().with_timezone_opt(tz.clone()),
+            )),
+            Timestamp(Millisecond, tz) => Ok(EncodeBuilder::TsMs(
+                TimestampMillisecondBuilder::new().with_timezone_opt(tz.clone()),
+            )),
+            Timestamp(Microsecond, tz) => Ok(EncodeBuilder::TsMicro(
+                TimestampMicrosecondBuilder::new().with_timezone_opt(tz.clone()),
+            )),
+            Timestamp(Nanosecond, tz) => Ok(EncodeBuilder::TsNano(
+                TimestampNanosecondBuilder::new().with_timezone_opt(tz.clone()),
+            )),
 
             // Date variants
-            Date32 => Ok(EncodeBuilder::Date32(Date32Builder::new())),
+            Date32 => Ok(EncodeBuilder::Date32(Date32Builder::with_capacity(
+                capacity,
+            ))),
             Date64 => Ok(EncodeBuilder::Date64(Date64Builder::with_capacity(
                 capacity,
             ))),

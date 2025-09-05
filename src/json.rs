@@ -7,12 +7,9 @@ use base64::Engine;
 use chrono::{FixedOffset, NaiveDateTime, TimeZone, Timelike};
 use half::f16;
 use serde_json::Value as Json;
-use std::{
-    ops::{Deref, DerefMut},
-    sync::Arc,
-};
+use std::sync::Arc;
 
-use super::{BuilderFromField, EncodeBuilder as EB, EncodeBuilderError, RowBuilder};
+use super::{ColumnEncoder, ColumnFactory, EncodeBuilder as EB, EncodeBuilderError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum JsonEncodeError {
@@ -40,49 +37,37 @@ pub enum JsonEncodeError {
     EncodeBuilderError(#[from] EncodeBuilderError),
 }
 
-pub struct JsonEncodeBuilder(EB);
-
-impl Deref for JsonEncodeBuilder {
-    type Target = EB;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+pub struct JsonColumn {
+    builder: EB,
+    field: Arc<Field>,
 }
 
-impl DerefMut for JsonEncodeBuilder {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl JsonEncodeBuilder {
-    pub fn try_new(data_type: &DT) -> Result<Self, JsonEncodeError> {
-        Ok(Self(EB::try_new(data_type)?))
-    }
-    pub fn try_with_capacity(data_type: &DT, capacity: usize) -> Result<Self, JsonEncodeError> {
-        Ok(Self(EB::try_with_capacity(data_type, capacity)?))
-    }
-}
-
-impl BuilderFromField for JsonEncodeBuilder {
+impl ColumnEncoder<Json> for JsonColumn {
     type Error = JsonEncodeError;
-    fn try_from_field(field: &Arc<Field>) -> Result<Self, Self::Error> {
-        JsonEncodeBuilder::try_new(field.data_type())
-    }
-}
 
-impl RowBuilder for JsonEncodeBuilder {
-    type Error = JsonEncodeError;
-    type Row = serde_json::Value;
-
-    fn append_row(&mut self, field: &Arc<Field>, value: &Self::Row) -> Result<(), Self::Error> {
-        let value = value.get(field.name()).unwrap_or(&Json::Null);
-        append_json(&mut self.0, field, value)
+    fn append(&mut self, row: &Json) -> Result<(), Self::Error> {
+        // pick value for this column from the row by field name
+        let v = row.get(self.field.name()).unwrap_or(&Json::Null);
+        append_json(&mut self.builder, &self.field, v)
     }
 
     fn finish(&mut self) -> ArrayRef {
-        ArrayBuilder::finish(&mut self.0)
+        ArrayBuilder::finish(&mut self.builder)
+    }
+}
+
+pub struct JsonFactory;
+
+impl ColumnFactory<Json> for JsonFactory {
+    type Error = JsonEncodeError;
+    type Col = JsonColumn;
+
+    fn make(field: &Field, capacity: usize, _ctx: &()) -> Result<Self::Col, Self::Error> {
+        let builder = EB::try_with_capacity(field.data_type(), capacity)?;
+        Ok(JsonColumn {
+            builder,
+            field: Arc::new(field.clone()),
+        })
     }
 }
 
@@ -498,44 +483,44 @@ pub fn append_json(
         // Decimal types - parse from string or number
         // Decimal32 supported only with Arrow 56+
         #[cfg(feature = "arrow-56")]
-        (EB::Decimal32(b), DT::Decimal32(_precision, scale), Json::Number(n)) => {
-            let scaled_val =
-                (n.as_f64().ok_or_else(unexpected)? * 10_f64.powi(*scale as i32)) as i32;
+        (EB::Decimal32(b), DT::Decimal32(precision, scale), Json::Number(n)) => {
+            let scaled_val = parse_decimal_i32(n.to_string().as_str(), *precision, *scale)
+                .map_err(|_| unexpected())?;
             b.append_value(scaled_val);
             Ok(())
         }
         #[cfg(feature = "arrow-56")]
-        (EB::Decimal32(b), DT::Decimal32(_precision, scale), Json::String(s)) => {
-            let num: f64 = s.parse().map_err(|_| unexpected())?;
-            let scaled_val = (num * 10_f64.powi(*scale as i32)) as i32;
+        (EB::Decimal32(b), DT::Decimal32(precision, scale), Json::String(s)) => {
+            let scaled_val = parse_decimal_i32(s, *precision, *scale)
+                .map_err(|_| unexpected())?;
             b.append_value(scaled_val);
             Ok(())
         }
 
-        (EB::Decimal128(b), DT::Decimal128(_precision, scale), Json::Number(n)) => {
-            let scaled_val =
-                (n.as_f64().ok_or_else(unexpected)? * 10_f64.powi(*scale as i32)) as i128;
+        (EB::Decimal128(b), DT::Decimal128(precision, scale), Json::Number(n)) => {
+            let scaled_val = parse_decimal_i128(n.to_string().as_str(), *precision, *scale)
+                .map_err(|_| unexpected())?;
             b.append_value(scaled_val);
             Ok(())
         }
-        (EB::Decimal128(b), DT::Decimal128(_precision, scale), Json::String(s)) => {
-            let num: f64 = s.parse().map_err(|_| unexpected())?;
-            let scaled_val = (num * 10_f64.powi(*scale as i32)) as i128;
+        (EB::Decimal128(b), DT::Decimal128(precision, scale), Json::String(s)) => {
+            let scaled_val = parse_decimal_i128(s, *precision, *scale)
+                .map_err(|_| unexpected())?;
             b.append_value(scaled_val);
             Ok(())
         }
 
-        (EB::Decimal256(b), DT::Decimal256(_precision, scale), Json::Number(n)) => {
+        (EB::Decimal256(b), DT::Decimal256(precision, scale), Json::Number(n)) => {
             use arrow::datatypes::i256;
-            let scaled_val =
-                (n.as_f64().ok_or_else(unexpected)? * 10_f64.powi(*scale as i32)) as i128;
+            let scaled_val = parse_decimal_i128(n.to_string().as_str(), *precision, *scale)
+                .map_err(|_| unexpected())?;
             b.append_value(i256::from_i128(scaled_val));
             Ok(())
         }
-        (EB::Decimal256(b), DT::Decimal256(_precision, scale), Json::String(s)) => {
+        (EB::Decimal256(b), DT::Decimal256(precision, scale), Json::String(s)) => {
             use arrow::datatypes::i256;
-            let num: f64 = s.parse().map_err(|_| unexpected())?;
-            let scaled_val = (num * 10_f64.powi(*scale as i32)) as i128;
+            let scaled_val = parse_decimal_i128(s, *precision, *scale)
+                .map_err(|_| unexpected())?;
             b.append_value(i256::from_i128(scaled_val));
             Ok(())
         }
@@ -603,15 +588,45 @@ fn parse_timestamp_from_json(
                 })
                 .map_err(JsonEncodeError::TimestampParseError)
         }
-        // 2025-09-02T21:15:22.276
         Json::Number(n) => {
-            // Assume Unix timestamp in seconds
-            let timestamp = n.as_i64().ok_or_else(|| {
-                JsonEncodeError::InvalidDateValue("Invalid timestamp number".to_string())
-            })?;
-            chrono::DateTime::from_timestamp(timestamp, 0)
-                .map(|dt| dt.fixed_offset())
-                .ok_or_else(|| JsonEncodeError::InvalidDateValue("Invalid timestamp".to_string()))
+            // Try to detect the unit based on the magnitude
+            if let Some(i) = n.as_i64() {
+                // Reasonable ranges for different units (rough approximation)
+                // Seconds: 0 to ~2^31 (year 2038)
+                // Milliseconds: ~10^12 to ~10^13 
+                // Microseconds: ~10^15 to ~10^16
+                // Nanoseconds: ~10^18 to ~10^19
+                
+                let abs_val = i.abs();
+                let (secs, nanos) = if abs_val < 10_000_000_000i64 {
+                    // Likely seconds
+                    (i, 0)
+                } else if abs_val < 10_000_000_000_000i64 {
+                    // Likely milliseconds
+                    (i / 1000, ((i % 1000) * 1_000_000) as u32)
+                } else if abs_val < 10_000_000_000_000_000i64 {
+                    // Likely microseconds
+                    (i / 1_000_000, ((i % 1_000_000) * 1000) as u32)
+                } else {
+                    // Likely nanoseconds
+                    (i / 1_000_000_000, (i % 1_000_000_000) as u32)
+                };
+                
+                chrono::DateTime::from_timestamp(secs, nanos)
+                    .map(|dt| dt.fixed_offset())
+                    .ok_or_else(|| JsonEncodeError::InvalidDateValue("Invalid timestamp".to_string()))
+            } else if let Some(f) = n.as_f64() {
+                // Float seconds with fractional part
+                let secs = f.trunc() as i64;
+                let nanos = ((f.fract() * 1_000_000_000.0) as u32).min(999_999_999);
+                chrono::DateTime::from_timestamp(secs, nanos)
+                    .map(|dt| dt.fixed_offset())
+                    .ok_or_else(|| JsonEncodeError::InvalidDateValue("Invalid timestamp".to_string()))
+            } else {
+                Err(JsonEncodeError::InvalidDateValue(
+                    "Invalid timestamp number".to_string(),
+                ))
+            }
         }
         _ => Err(JsonEncodeError::InvalidDateValue(
             "Invalid timestamp format".to_string(),
@@ -711,6 +726,120 @@ fn parse_duration_from_json(value: &Json) -> Result<i64, JsonEncodeError> {
             "Invalid duration format".to_string(),
         )),
     }
+}
+
+// Parse decimal from string without using f64 to avoid precision loss
+fn parse_decimal_i32(s: &str, _precision: u8, scale: i8) -> Result<i32, String> {
+    let s = s.trim();
+    let negative = s.starts_with('-');
+    let s = if negative { &s[1..] } else { s };
+    
+    let (int_part, frac_part) = if let Some(dot_pos) = s.find('.') {
+        let (int_str, frac_str) = s.split_at(dot_pos);
+        (int_str, &frac_str[1..]) // skip the dot
+    } else {
+        (s, "")
+    };
+    
+    // Parse integer part
+    let mut value: i64 = int_part.parse()
+        .map_err(|e| format!("Failed to parse integer part: {}", e))?;
+    
+    // Scale up by the scale factor
+    for _ in 0..scale {
+        value = value.saturating_mul(10);
+    }
+    
+    // Add fractional part
+    if !frac_part.is_empty() {
+        let frac_digits = frac_part.len();
+        let frac_value: i64 = frac_part.parse()
+            .map_err(|e| format!("Failed to parse fractional part: {}", e))?;
+        
+        // Scale the fractional part appropriately
+        if frac_digits <= scale as usize {
+            // Need to scale up more
+            let additional_scale = scale as usize - frac_digits;
+            let mut scaled_frac = frac_value;
+            for _ in 0..additional_scale {
+                scaled_frac = scaled_frac.saturating_mul(10);
+            }
+            value = value.saturating_add(scaled_frac);
+        } else {
+            // Need to round - for simplicity, truncate
+            let divisor_count = frac_digits - scale as usize;
+            let mut scaled_frac = frac_value;
+            for _ in 0..divisor_count {
+                scaled_frac = scaled_frac / 10;
+            }
+            value = value.saturating_add(scaled_frac);
+        }
+    }
+    
+    if negative {
+        value = -value;
+    }
+    
+    // Check if fits in i32
+    if value > i32::MAX as i64 || value < i32::MIN as i64 {
+        return Err("Value out of range for i32".to_string());
+    }
+    
+    Ok(value as i32)
+}
+
+fn parse_decimal_i128(s: &str, _precision: u8, scale: i8) -> Result<i128, String> {
+    let s = s.trim();
+    let negative = s.starts_with('-');
+    let s = if negative { &s[1..] } else { s };
+    
+    let (int_part, frac_part) = if let Some(dot_pos) = s.find('.') {
+        let (int_str, frac_str) = s.split_at(dot_pos);
+        (int_str, &frac_str[1..]) // skip the dot
+    } else {
+        (s, "")
+    };
+    
+    // Parse integer part
+    let mut value: i128 = int_part.parse()
+        .map_err(|e| format!("Failed to parse integer part: {}", e))?;
+    
+    // Scale up by the scale factor
+    for _ in 0..scale {
+        value = value.saturating_mul(10);
+    }
+    
+    // Add fractional part
+    if !frac_part.is_empty() {
+        let frac_digits = frac_part.len();
+        let frac_value: i128 = frac_part.parse()
+            .map_err(|e| format!("Failed to parse fractional part: {}", e))?;
+        
+        // Scale the fractional part appropriately
+        if frac_digits <= scale as usize {
+            // Need to scale up more
+            let additional_scale = scale as usize - frac_digits;
+            let mut scaled_frac = frac_value;
+            for _ in 0..additional_scale {
+                scaled_frac = scaled_frac.saturating_mul(10);
+            }
+            value = value.saturating_add(scaled_frac);
+        } else {
+            // Need to round - for simplicity, truncate
+            let divisor_count = frac_digits - scale as usize;
+            let mut scaled_frac = frac_value;
+            for _ in 0..divisor_count {
+                scaled_frac = scaled_frac / 10;
+            }
+            value = value.saturating_add(scaled_frac);
+        }
+    }
+    
+    if negative {
+        value = -value;
+    }
+    
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -1596,16 +1725,23 @@ mod tests {
 
     fn encode_values(
         schema: Arc<Schema>,
-        values: &[serde_json::Value],
+        values: &[Json],
     ) -> Result<Vec<RecordBatch>, JsonEncodeError> {
-        let batches = FieldBatchEncoder::<JsonEncodeBuilder, _>::from_schema(
-            schema,
-            values.iter().cloned(),
-            1024,
-        )?
-        .collect::<Result<Vec<_>, JsonEncodeError>>()?;
-        let rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
-        assert_eq!(rows, values.len(), "Batch count mismatch");
+        // Turn the slice into an iterator of Json rows
+        let rows = values.iter().cloned();
+
+        // Build encoder and collect all batches
+        let batches =
+            FieldBatchEncoder::<Json, JsonColumn, _>::from_schema_with::<JsonFactory, ()>(
+                schema,
+                rows,
+                1024,
+                &(),
+            )?
+            .collect::<Result<Vec<_>, JsonEncodeError>>()?;
+
+        let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(row_count, values.len(), "Batch count mismatch");
         Ok(batches)
     }
 }
