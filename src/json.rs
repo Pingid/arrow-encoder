@@ -605,11 +605,23 @@ fn parse_timestamp_from_json(
         }
         // 2025-09-02T21:15:22.276
         Json::Number(n) => {
-            // Assume Unix timestamp in seconds
             let timestamp = n.as_i64().ok_or_else(|| {
                 JsonEncodeError::InvalidDateValue("Invalid timestamp number".to_string())
             })?;
-            chrono::DateTime::from_timestamp(timestamp, 0)
+
+            // Detect if timestamp is in seconds or milliseconds
+            // Timestamps after year 2001 (978307200) in seconds would be > 978307200
+            // Timestamps in milliseconds would be much larger (> 978307200000)
+            let (secs, nanos) = if timestamp > 1_000_000_000_000 {
+                // Likely milliseconds - convert to seconds and nanoseconds
+                let millis = timestamp % 1000;
+                (timestamp / 1000, (millis * 1_000_000) as u32)
+            } else {
+                // Likely seconds
+                (timestamp, 0)
+            };
+
+            chrono::DateTime::from_timestamp(secs, nanos)
                 .map(|dt| dt.fixed_offset())
                 .ok_or_else(|| JsonEncodeError::InvalidDateValue("Invalid timestamp".to_string()))
         }
